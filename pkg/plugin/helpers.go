@@ -414,6 +414,120 @@ func getDataLabels(useNewFormat bool, q *PiProcessedQuery, pointType string, des
 	return frameLabel
 }
 
+// convertStreamItemsToFrame builds a Grafana data.Frame from a slice of live PI Web API
+// WebSocket items. It uses pre-computed WebID metadata from cache instead of querying
+// the datasource on every message, avoiding per-message mutex acquisition.
+func convertStreamItemsToFrame(processedQuery *PiProcessedQuery, items []PiBatchContentItem, cache streamFrameCache) (*data.Frame, error) {
+	includeMetaData := processedQuery.UseUnit
+	digitalStates := processedQuery.DigitalStates
+	noDataReplace := processedQuery.getNoDataReplace()
+
+	digitalStateValues := make([]string, 0)
+	fP := FrameProcessed{
+		sliceType:  cache.sliceType,
+		prevVal:    reflect.Zero(cache.sliceType),
+		values:     reflect.MakeSlice(reflect.SliceOf(cache.sliceType.Elem()), 0, 0).Interface(),
+		badValues:  make([]int, 0),
+		timestamps: make([]time.Time, 0),
+	}
+
+	frameLabel := cache.frameLabel
+	labels := cache.labels
+	digitalState := cache.digitalState
+
+	frame := data.NewFrame("")
+
+	for i, item := range items {
+		if item.Value == nil {
+			log.DefaultLogger.Debug("Convert stream items - nil value", "item", item)
+			fP = updateBadData(i, fP, item.Timestamp, noDataReplace)
+			continue
+		}
+
+		fP.val = reflect.ValueOf(item.Value)
+
+		if !fP.val.IsValid() {
+			log.DefaultLogger.Debug("Convert stream items - invalid value", "item", item)
+			fP = updateBadData(i, fP, item.Timestamp, noDataReplace)
+			continue
+		}
+
+		if fP.val.IsValid() && fP.val.Kind() == reflect.Ptr {
+			fP.val = fP.val.Elem()
+		}
+
+		if fP.sliceType == reflect.TypeOf([]time.Time{}) {
+			var err error
+			fP.val, err = parseTimestampValue(fP.val)
+			if err != nil {
+				log.DefaultLogger.Error("Convert stream items - parseTimestampValue",
+					"error", err.Error(), "kind", fP.val.Kind().String(), "item", item)
+				continue
+			}
+		}
+
+		_, digitalState = item.Value.(map[string]interface{})
+		if !item.isGood() {
+			fP = updateBadData(i, fP, item.Timestamp, noDataReplace)
+		} else if digitalState {
+			var pds PointDigitalState
+			if b, err := json.Marshal(item.Value); err == nil {
+				if err := json.Unmarshal(b, &pds); err == nil {
+					fP.timestamps = append(fP.timestamps, item.Timestamp)
+					digitalStateValues = append(digitalStateValues, pds.Name)
+					pdsValue := reflect.ValueOf(pds.Value)
+					itemValue := pdsValue.Convert(fP.sliceType.Elem())
+					fP.values = reflect.Append(reflect.ValueOf(fP.values), itemValue).Interface()
+					fP.prevVal = itemValue
+				} else {
+					log.DefaultLogger.Error("Convert stream items - error unmarshalling digital state", err)
+					fP = updateBadData(i, fP, item.Timestamp, noDataReplace)
+				}
+			} else {
+				log.DefaultLogger.Error("Convert stream items - error marshalling digital state", err)
+				fP = updateBadData(i, fP, item.Timestamp, noDataReplace)
+			}
+		} else if fP.val.Type().Kind() != fP.sliceType.Elem().Kind() {
+			if compatible(fP.val.Type(), fP.sliceType.Elem()) {
+				fP.timestamps = append(fP.timestamps, item.Timestamp)
+				fP.values = reflect.Append(reflect.ValueOf(fP.values), fP.val.Convert(fP.sliceType.Elem())).Interface()
+				fP.prevVal = fP.val
+				log.DefaultLogger.Debug("Convert stream items - type mismatch converted",
+					"from", fP.val.Type().String(), "to", fP.sliceType.Elem().String())
+			} else {
+				fP = updateBadData(i, fP, item.Timestamp, noDataReplace)
+				log.DefaultLogger.Warn("Convert stream items - incompatible type, dropping value",
+					"from", fP.val.Type().String(), "to", fP.sliceType.Elem().String())
+			}
+		} else {
+			fP.timestamps = append(fP.timestamps, item.Timestamp)
+			fP.values = reflect.Append(reflect.ValueOf(fP.values), fP.val).Interface()
+			fP.prevVal = fP.val
+		}
+	}
+
+	valuepointers := convertSliceToPointers(fP.values, fP.badValues)
+	timeField := data.NewField(data.TimeSeriesTimeFieldName, nil, fP.timestamps)
+
+	if !digitalState || !digitalStates {
+		valueField := data.NewField(frameLabel["name"], labels, valuepointers)
+		frame.Fields = append(frame.Fields, timeField, valueField)
+	} else {
+		fieldConfig := &data.FieldConfig{}
+		if includeMetaData {
+			fieldConfig.Unit = cache.units
+			fieldConfig.Description = cache.description
+		}
+		valueField := data.NewField(frameLabel["name"], labels, digitalStateValues)
+		valueField.SetConfig(fieldConfig)
+		frame.Fields = append(frame.Fields, timeField, valueField)
+	}
+
+	frame.Meta = &data.FrameMeta{}
+	frame.RefID = processedQuery.RefID
+	return frame, nil
+}
+
 func convertItemsToDataFrame(processedQuery *PiProcessedQuery, d *Datasource, SummaryType string) (*data.Frame, error) {
 	items := *processedQuery.Response.getItems(SummaryType)
 	webID := processedQuery.WebID

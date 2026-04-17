@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -299,6 +300,35 @@ func (d *Datasource) batchRequest(ctx context.Context, PIWebAPIQueriesAll []PiPr
 func (d *Datasource) processBatchtoFrames(processedQuery map[string][]PiProcessedQuery) *backend.QueryDataResponse {
 	response := backend.NewQueryDataResponse()
 
+	// Pre-pass: collect all streamable WebIDs so every tag in this batch can share a
+	// single streamsets/channel WebSocket connection instead of one socket per tag.
+	var streamableWebIDs []string
+	for _, queries := range processedQuery {
+		for i := range queries {
+			if queries[i].Streamable && queries[i].WebID != "" {
+				streamableWebIDs = append(streamableWebIDs, queries[i].WebID)
+			}
+		}
+	}
+	var connectionKey string
+	if len(streamableWebIDs) > 0 {
+		sort.Strings(streamableWebIDs)
+		// Deduplicate (same tag may appear in multiple summary types)
+		uniq := streamableWebIDs[:0]
+		for i, id := range streamableWebIDs {
+			if i == 0 || id != streamableWebIDs[i-1] {
+				uniq = append(uniq, id)
+			}
+		}
+		connectionKey = strings.Join(uniq, "|")
+		// Copy to break the reference to the local slice's backing array before long-term storage.
+		webIDsCopy := make([]string, len(uniq))
+		copy(webIDsCopy, uniq)
+		d.datasourceMutex.Lock()
+		d.connectionKeyWebIDs[connectionKey] = webIDsCopy
+		d.datasourceMutex.Unlock()
+	}
+
 	for RefID, query := range processedQuery {
 		var subResponse backend.DataResponse
 		for _, q := range query {
@@ -327,21 +357,18 @@ func (d *Datasource) processBatchtoFrames(processedQuery map[string][]PiProcesse
 				// meta data
 				frame.Meta.ExecutedQueryString = strings.ReplaceAll(q.Resource, "{0}", q.WebID)
 
-				// TODO: enable streaming
-				// If the query is streamable, then we need to set the channel URI
-				// and the executed query string.
+				// If the query is streamable, register a channel so Grafana subscribes to
+				// the live WebSocket stream for this tag. A new UUID is used per request
+				// so that time-range changes trigger a fresh subscription.
 				if q.Streamable {
-					// Create a new channel for this frame request.
-					// Creating a new channel for each frame request is not ideal,
-					// but it is the only way to ensure that the frame data is refreshed
-					// on a time interval update.
 					channeluuid := uuid.New()
 					channelURI := "ds/" + q.UID + "/" + channeluuid.String()
 					channel := StreamChannelConstruct{
-						WebID:               q.WebID,
-						IntervalNanoSeconds: q.IntervalNanoSeconds,
-						tagLabel:            q.Label,
-						query:               &q,
+						WebID:         q.WebID,
+						ConnectionKey: connectionKey,
+						tagLabel:      q.Label,
+						query:         &q,
+						frameCache:    buildStreamFrameCache(d, &q),
 					}
 					d.channelConstruct[channeluuid.String()] = channel
 					frame.Meta.Channel = channelURI
@@ -458,6 +485,9 @@ func _getDurationBase(duration string) string {
 func (q *PIWebAPIQuery) getSummaryURIComponent() string {
 	uri := ""
 	for _, t := range *q.Summary.Types {
+		if t.Value.Value == "" {
+			continue
+		}
 		uri += "&summaryType=" + t.Value.Value
 	}
 	uri += "&calculationBasis=" + *q.Summary.Basis
