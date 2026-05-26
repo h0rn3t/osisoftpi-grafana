@@ -62,6 +62,13 @@
 - Fixed warnings during deploy
 - Fixed LICENSE file
 
+### 5.3.0
+
+- Added PI Web API streamsets/channel WebSocket streaming support (PR #203)
+- All tags in a query batch share a single persistent WebSocket connection
+- Enable Streaming Support toggle in datasource config and per-query streaming in Query Editor
+- Unit tests for streaming URL builder, fan-out, subscriber lifecycle, and frame conversion
+
 ### 5.2.0
 
 - Improved query performance to PiWebAPI by joing all queries in Panel into one batch request only
