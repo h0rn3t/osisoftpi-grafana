@@ -97,7 +97,32 @@ func NewPIWebAPIDatasource(ctx context.Context, settings backend.DataSourceInsta
 // created. As soon as datasource settings change detected by SDK old datasource instance will
 // be disposed and a new one will be created using NewSampleDatasource factory function.
 func (d *Datasource) Dispose() {
-	d.httpClient.CloseIdleConnections()
+	d.websocketConnectionsMutex.Lock()
+	for connectionKey, conn := range d.websocketConnections {
+		if conn != nil {
+			conn.Close()
+		}
+		delete(d.websocketConnections, connectionKey)
+	}
+	d.websocketConnectionsMutex.Unlock()
+
+	d.datasourceMutex.Lock()
+	for _, senders := range d.senderChannels {
+		for _, ch := range senders {
+			close(ch)
+		}
+	}
+	d.senderChannels = make(map[string]map[*backend.StreamSender]chan StreamData)
+	d.channelConstruct = make(map[string]StreamChannelConstruct)
+	d.connectionKeyWebIDs = make(map[string][]string)
+	d.datasourceMutex.Unlock()
+
+	if d.scheduler != nil {
+		d.scheduler.Clear()
+	}
+	if d.httpClient != nil {
+		d.httpClient.CloseIdleConnections()
+	}
 }
 
 // update call rate - enforce max call rate of 500 req/s
@@ -338,12 +363,9 @@ func (d *Datasource) isUsingNewFormat() bool {
 	return d.dataSourceOptions.NewFormat != nil && *d.dataSourceOptions.NewFormat
 }
 
-// isUsingStreaming checks whether the datasource has streaming enabled in experimental mode.
-// This requires both the UseExperimental and UseStreaming options to be set and enabled.
-// Returns true if both options are enabled; otherwise, false.
+// isUsingStreaming перевіряє, чи увімкнено streaming на рівні datasource.
 func (d *Datasource) isUsingStreaming() bool {
-	return d.dataSourceOptions.UseExperimental != nil && *d.dataSourceOptions.UseExperimental &&
-		d.dataSourceOptions.UseStreaming != nil && *d.dataSourceOptions.UseStreaming
+	return d.dataSourceOptions.UseStreaming != nil && *d.dataSourceOptions.UseStreaming
 }
 
 // isUsingResponseCache checks if response caching is enabled in experimental mode for the datasource.

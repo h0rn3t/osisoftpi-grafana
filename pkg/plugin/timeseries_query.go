@@ -370,7 +370,10 @@ func (d *Datasource) processBatchtoFrames(processedQuery map[string][]PiProcesse
 						query:         &q,
 						frameCache:    buildStreamFrameCache(d, &q),
 					}
+					d.datasourceMutex.Lock()
+					d.sweepStaleChannelConstructs(q.WebID)
 					d.channelConstruct[channeluuid.String()] = channel
+					d.datasourceMutex.Unlock()
 					frame.Meta.Channel = channelURI
 				}
 

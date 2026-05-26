@@ -95,8 +95,7 @@ export class PIWebAPIConfigEditor extends PureComponent<Props, State> {
     const { onOptionsChange, options } = this.props;
     const jsonData = {
       ...options.jsonData,
-      useExperimental : event.target.checked,
-      useStreaming : event.target.checked ? options.jsonData.useStreaming : false,
+      useExperimental: event.target.checked,
     };
     onOptionsChange({ ...options, jsonData });
   };

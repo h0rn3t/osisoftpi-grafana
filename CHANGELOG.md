@@ -62,6 +62,15 @@
 - Fixed warnings during deploy
 - Fixed LICENSE file
 
+### 5.3.1
+
+- Streaming enablement depends only on **Enable Streaming Support** (no experimental mode required)
+- Stricter stream eligibility: PI points only; excludes summary, interpolated, recorded values, and expression queries
+- WebSocket read-loop failure closes subscriber channels; bounded reconnect with exponential backoff (max 5 attempts, 1s–30s)
+- Mutex-protected `channelConstruct` registry with stale-entry sweep; improved `Dispose()` cleanup
+- Sender overload: brief blocking send (50ms) before drop with structured logging
+- Renamed `steam.go` to `stream.go`
+
 ### 5.3.0
 
 - Added PI Web API streamsets/channel WebSocket streaming support (PR #203)

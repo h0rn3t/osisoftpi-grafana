@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -87,7 +88,9 @@ func TestSubscribeStream_PermissionDenied(t *testing.T) {
 
 func TestSubscribeStream_OK(t *testing.T) {
 	ds := newTestDatasource()
+	ds.datasourceMutex.Lock()
 	ds.channelConstruct["test-uuid"] = StreamChannelConstruct{WebID: "WEBID1"}
+	ds.datasourceMutex.Unlock()
 
 	resp, err := ds.SubscribeStream(context.Background(), &backend.SubscribeStreamRequest{
 		Path: "test-uuid",
@@ -260,4 +263,106 @@ func TestCheckForOrphanedWebSocket_WithSubscribers_KeepsConn(t *testing.T) {
 	if _, ok := ds.websocketConnections[connectionKey]; !ok {
 		t.Error("websocket connection should NOT have been removed while subscribers remain")
 	}
+}
+
+func TestSubscribeStream_DSPathFormat(t *testing.T) {
+	ds := newTestDatasource()
+	ds.datasourceMutex.Lock()
+	ds.channelConstruct["test-uuid"] = StreamChannelConstruct{WebID: "WEBID1"}
+	ds.datasourceMutex.Unlock()
+
+	resp, err := ds.SubscribeStream(context.Background(), &backend.SubscribeStreamRequest{
+		Path: "ds/my-ds/test-uuid",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Status != backend.SubscribeStreamStatusOK {
+		t.Errorf("got status %v, want OK", resp.Status)
+	}
+}
+
+func TestSweepStaleChannelConstructs_RemovesOrphans(t *testing.T) {
+	ds := newTestDatasource()
+	ds.datasourceMutex.Lock()
+	ds.channelConstruct["old-uuid"] = StreamChannelConstruct{WebID: "WEBID1"}
+	ds.sweepStaleChannelConstructs("WEBID1")
+	if _, ok := ds.channelConstruct["old-uuid"]; ok {
+		t.Error("expected stale construct to be removed")
+	}
+	ds.datasourceMutex.Unlock()
+}
+
+func TestReadLoopFailure_ClosesSubscriberChannels(t *testing.T) {
+	ds := newTestDatasource()
+	webID := "WEBID_CLOSE"
+	connectionKey := webID
+	sender := &backend.StreamSender{}
+	ch := ds.addStreamSender(webID, sender)
+	ds.connectionKeyWebIDs[connectionKey] = []string{webID}
+
+	ds.closeSendersForConnection(connectionKey)
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected closed channel after connection teardown")
+		}
+	default:
+		t.Fatal("expected immediate read from closed channel")
+	}
+}
+
+func TestDispose_ClearsStreamingState(t *testing.T) {
+	ds := newTestDatasource()
+	sender := &backend.StreamSender{}
+	ch := ds.addStreamSender("WEBID_DISPOSE", sender)
+	ds.datasourceMutex.Lock()
+	ds.channelConstruct["uuid"] = StreamChannelConstruct{WebID: "WEBID_DISPOSE"}
+	ds.connectionKeyWebIDs["WEBID_DISPOSE"] = []string{"WEBID_DISPOSE"}
+	ds.datasourceMutex.Unlock()
+	ds.websocketConnections["WEBID_DISPOSE"] = nil
+
+	ds.Dispose()
+
+	ds.datasourceMutex.Lock()
+	defer ds.datasourceMutex.Unlock()
+	if len(ds.channelConstruct) != 0 || len(ds.senderChannels) != 0 || len(ds.connectionKeyWebIDs) != 0 {
+		t.Error("expected streaming maps to be cleared after Dispose")
+	}
+	ds.websocketConnectionsMutex.Lock()
+	defer ds.websocketConnectionsMutex.Unlock()
+	if len(ds.websocketConnections) != 0 {
+		t.Error("expected websocket connections map to be cleared after Dispose")
+	}
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Error("expected sender channel to be closed after Dispose")
+		}
+	default:
+		t.Error("expected closed channel read to complete immediately")
+	}
+}
+
+func TestConcurrentRegisterAndSubscribe(t *testing.T) {
+	ds := newTestDatasource()
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			ds.datasourceMutex.Lock()
+			id := fmt.Sprintf("uuid-%d", i)
+			ds.channelConstruct[id] = StreamChannelConstruct{WebID: "WEBID1"}
+			ds.datasourceMutex.Unlock()
+		}
+		close(done)
+	}()
+
+	for i := 0; i < 100; i++ {
+		_, _ = ds.SubscribeStream(context.Background(), &backend.SubscribeStreamRequest{
+			Path: fmt.Sprintf("uuid-%d", i),
+		})
+	}
+	<-done
 }

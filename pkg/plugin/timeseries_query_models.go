@@ -77,7 +77,14 @@ func (q *Query) isstreamingEnabled() bool {
 }
 
 func (q *Query) isStreamable() bool {
-	return !q.Pi.isExpression() && q.isstreamingEnabled()
+	if !q.isstreamingEnabled() {
+		return false
+	}
+	if q.Pi.isExpression() || q.Pi.isSummary() || q.Pi.isInterpolated() || q.Pi.isRecordedValues() {
+		return false
+	}
+	// PI Web API streamsets/channel — лише для PI points, не AF attributes.
+	return q.Pi.IsPiPoint
 }
 
 // func (q *PiProcessedQuery) isSummary() bool {

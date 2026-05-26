@@ -10,10 +10,18 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	streamReconnectMaxAttempts = 5
+	streamReconnectInitial     = time.Second
+	streamReconnectMaxBackoff  = 30 * time.Second
+	streamSenderBlockTimeout   = 50 * time.Millisecond
 )
 
 // streamFrameCache holds pre-computed, per-WebID metadata that is static for the lifetime
@@ -74,13 +82,63 @@ func buildStreamSetsWebSocketURL(baseURL string, webIDs []string) (string, error
 	return uri + "streamsets/channel?" + strings.Join(params, "&"), nil
 }
 
+// extractStreamPath повертає UUID каналу з повного шляху ds/<uid>/<uuid> або як є.
+func extractStreamPath(path string) string {
+	if strings.HasPrefix(path, "ds/") {
+		parts := strings.Split(path, "/")
+		if len(parts) >= 3 {
+			return parts[len(parts)-1]
+		}
+	}
+	return path
+}
+
+// sweepStaleChannelConstructs видаляє реєстрації каналу для webID без активних підписників.
+// Викликати під datasourceMutex.
+func (d *Datasource) sweepStaleChannelConstructs(webID string) {
+	if len(d.senderChannels[webID]) > 0 {
+		return
+	}
+	for path, construct := range d.channelConstruct {
+		if construct.WebID == webID {
+			delete(d.channelConstruct, path)
+		}
+	}
+}
+
+// closeSendersForConnection закриває всі sender channels для WebIDs на цьому connection key.
+// Порядок блокувань: websocketConnectionsMutex, потім datasourceMutex.
+func (d *Datasource) closeSendersForConnection(connectionKey string) {
+	d.websocketConnectionsMutex.Lock()
+	d.datasourceMutex.Lock()
+	webIDs := d.connectionKeyWebIDs[connectionKey]
+	for _, webID := range webIDs {
+		chans, ok := d.senderChannels[webID]
+		if !ok {
+			continue
+		}
+		for sender, ch := range chans {
+			close(ch)
+			delete(chans, sender)
+		}
+		if len(chans) == 0 {
+			delete(d.senderChannels, webID)
+		}
+	}
+	d.datasourceMutex.Unlock()
+	d.websocketConnectionsMutex.Unlock()
+}
+
 // SubscribeStream is called by Grafana when a panel subscribes to a streaming channel.
 // It verifies that the requested path was registered during a prior QueryData call.
 func (d *Datasource) SubscribeStream(_ context.Context, req *backend.SubscribeStreamRequest) (*backend.SubscribeStreamResponse, error) {
+	path := extractStreamPath(req.Path)
 	status := backend.SubscribeStreamStatusPermissionDenied
-	if _, ok := d.channelConstruct[req.Path]; ok {
+	d.datasourceMutex.Lock()
+	if _, ok := d.channelConstruct[path]; ok {
 		status = backend.SubscribeStreamStatusOK
 	}
+	d.datasourceMutex.Unlock()
 	return &backend.SubscribeStreamResponse{Status: status}, nil
 }
 
@@ -104,7 +162,10 @@ func (d *Datasource) RunStream(ctx context.Context, req *backend.RunStreamReques
 // streamsets/channel WebSocket connection; readWebsocketMessages routes each StreamData
 // item to the correct per-tag sender channel by WebId.
 func (d *Datasource) subscribeToWebsocketChannel(ctx context.Context, path string, sender *backend.StreamSender, errchan chan error) {
+	path = extractStreamPath(path)
+	d.datasourceMutex.Lock()
 	construct, ok := d.channelConstruct[path]
+	d.datasourceMutex.Unlock()
 	if !ok {
 		errchan <- fmt.Errorf("streaming: no channel construct registered for path %q", path)
 		return
@@ -202,6 +263,7 @@ func (d *Datasource) createWebsocketConnection(webIDs []string) (*websocket.Conn
 // triggers a fresh dial.
 func (d *Datasource) readWebsocketMessages(conn *websocket.Conn, connectionKey string) {
 	defer conn.Close()
+	defer d.closeSendersForConnection(connectionKey)
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
@@ -228,18 +290,27 @@ func (d *Datasource) readWebsocketMessages(conn *websocket.Conn, connectionKey s
 		backend.Logger.Debug("Streaming: WebSocket message received",
 			"connectionKey", connectionKey, "items", len(streamResp.Items))
 
-		// Route each StreamData item to the sender channels for its specific WebId.
 		d.datasourceMutex.Lock()
 		for _, item := range streamResp.Items {
 			for _, ch := range d.senderChannels[item.WebId] {
-				select {
-				case ch <- item:
-				default:
-					backend.Logger.Warn("Streaming: sender channel full, dropping message", "webID", item.WebId)
-				}
+				dispatchStreamData(ch, item)
 			}
 		}
 		d.datasourceMutex.Unlock()
+	}
+}
+
+// dispatchStreamData доставляє повідомлення підписнику без блокування read loop надовго.
+func dispatchStreamData(ch chan StreamData, item StreamData) {
+	select {
+	case ch <- item:
+	default:
+		select {
+		case ch <- item:
+		case <-time.After(streamSenderBlockTimeout):
+			backend.Logger.Warn("Streaming: sender channel full, dropping message",
+				"webID", item.WebId, "dropped", true)
+		}
 	}
 }
 
@@ -255,25 +326,61 @@ func (d *Datasource) sendStreamData(
 	senderCh <-chan StreamData,
 	construct StreamChannelConstruct,
 ) {
+	path = extractStreamPath(path)
 	webID := construct.WebID
+	connectionKey := construct.ConnectionKey
+	backoff := streamReconnectInitial
+	reconnectAttempts := 0
+	currentCh := senderCh
+
+	defer func() {
+		d.removeStreamSender(webID, sender)
+		d.checkForOrphanedWebSocket(webID, connectionKey)
+		d.datasourceMutex.Lock()
+		delete(d.channelConstruct, path)
+		d.datasourceMutex.Unlock()
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			backend.Logger.Info("Streaming: subscriber context done", "path", path, "webID", webID)
-			d.removeStreamSender(webID, sender)
-			d.checkForOrphanedWebSocket(webID, construct.ConnectionKey)
-			d.datasourceMutex.Lock()
-			delete(d.channelConstruct, path)
-			d.datasourceMutex.Unlock()
 			errchan <- nil
 			return
 
-		case item, ok := <-senderCh:
+		case item, ok := <-currentCh:
 			if !ok {
-				// Channel was closed by removeStreamSender during a concurrent cleanup.
-				backend.Logger.Debug("Streaming: sender channel closed", "webID", webID)
-				errchan <- errors.New("streaming: sender channel closed")
-				return
+				reconnectAttempts++
+				if reconnectAttempts > streamReconnectMaxAttempts {
+					errchan <- fmt.Errorf("streaming: connection lost after %d reconnect attempts for %q",
+						streamReconnectMaxAttempts, connectionKey)
+					return
+				}
+				backend.Logger.Warn("Streaming: sender channel closed, reconnecting",
+					"webID", webID, "connectionKey", connectionKey,
+					"attempt", reconnectAttempts, "backoff", backoff)
+
+				select {
+				case <-ctx.Done():
+					errchan <- nil
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < streamReconnectMaxBackoff {
+					backoff *= 2
+					if backoff > streamReconnectMaxBackoff {
+						backoff = streamReconnectMaxBackoff
+					}
+				}
+
+				currentCh = d.addStreamSender(webID, sender)
+				if err := d.getOrCreateWebsocketConnection(connectionKey); err != nil {
+					backend.Logger.Error("Streaming: reconnect failed",
+						"connectionKey", connectionKey, "error", err)
+					d.removeStreamSender(webID, sender)
+					continue
+				}
+				continue
 			}
 
 			frame, err := convertStreamItemsToFrame(construct.query, item.Items, construct.frameCache)
@@ -286,12 +393,12 @@ func (d *Datasource) sendStreamData(
 			if err := sender.SendFrame(frame, data.IncludeDataOnly); err != nil {
 				backend.Logger.Error("Streaming: failed to send frame to subscriber",
 					"webID", webID, "error", err)
-				d.removeStreamSender(webID, sender)
-				d.checkForOrphanedWebSocket(webID, construct.ConnectionKey)
 				errchan <- fmt.Errorf("streaming: send frame failed: %w", err)
 				return
 			}
 
+			reconnectAttempts = 0
+			backoff = streamReconnectInitial
 			backend.Logger.Debug("Streaming: frame sent to subscriber",
 				"webID", webID, "items", len(item.Items))
 		}
